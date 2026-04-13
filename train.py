@@ -1,6 +1,7 @@
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import argparse
@@ -30,14 +31,11 @@ def create_sequences(data_dict, macro_df, seq_len, pred_len):
         targets = df['close'].pct_change().shift(-pred_len).values
         for i in range(seq_len, len(values) - pred_len):
             x_enc = values[i-seq_len:i]                 # (seq_len, feat_dim)
-            x_dec = values[i-seq_len : i+pred_len]     # (seq_len+pred_len, feat_dim) but we only need label_len? Simplified: use zeros for decoder start
-            # For decoder we need label_len (start tokens) + pred_len. Use the actual values for start tokens.
-            # Simpler: use zeros for decoder (informer can handle)
-            x_dec_padded = np.zeros((seq_len + pred_len, x_enc.shape[-1]))
-            x_dec_padded[:seq_len] = x_enc
+            x_dec = np.zeros((seq_len + pred_len, x_enc.shape[-1]))
+            x_dec[:seq_len] = x_enc
             y = targets[i+pred_len-1] if pred_len==1 else targets[i:i+pred_len]
             X_enc_list.append(x_enc)
-            X_dec_list.append(x_dec_padded)
+            X_dec_list.append(x_dec)
             y_list.append(y)
     X_enc = torch.tensor(np.array(X_enc_list), dtype=torch.float32)
     X_dec = torch.tensor(np.array(X_dec_list), dtype=torch.float32)
@@ -76,13 +74,12 @@ def generate_signals(option, model, device, macro_df, seq_len, pred_len):
         values = feat.values[-seq_len:].astype(np.float32)
         if len(values) < seq_len:
             continue
-        x_enc = torch.tensor(values, dtype=torch.float32).unsqueeze(0).to(device)  # (1, seq_len, feat_dim)
+        x_enc = torch.tensor(values, dtype=torch.float32).unsqueeze(0).to(device)
         x_dec = torch.zeros(1, seq_len+pred_len, feat.shape[-1], device=device)
         x_dec[:, :seq_len] = x_enc
         with torch.no_grad():
-            pred = model(x_enc, x_dec)  # (1, pred_len)
+            pred = model(x_enc, x_dec)
         mu = pred[0, -1].item()
-        # Heuristic confidence (same as before)
         sigma = 0.015  # placeholder
         confidence = 1 - 2 * sigma / (abs(mu) + sigma + 1e-8)
         forecasts[ticker] = {'mu': mu, 'sigma': sigma, 'confidence': confidence}
@@ -111,27 +108,22 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load data (exclude benchmarks for training)
     raw_data = load_dataset(args.option, include_benchmarks=False)
     macro_df = load_macro_data()
     if macro_df is None:
-        # dummy macro
         dummy_idx = next(iter(raw_data.values())).index
         macro_df = pd.DataFrame(index=dummy_idx, data={'dummy':0.0})
 
-    # Determine feature dimension from a sample ticker
     sample_ticker = next(iter(raw_data.keys()))
     sample_feat = engineer_features(raw_data[sample_ticker], macro_df)
     feature_dim = sample_feat.shape[1]
 
-    # Update config
     INFORMER_CONFIG['enc_in'] = feature_dim
     INFORMER_CONFIG['dec_in'] = feature_dim
     INFORMER_CONFIG['seq_len'] = LOOKBACK
     INFORMER_CONFIG['label_len'] = LOOKBACK // 2
     INFORMER_CONFIG['pred_len'] = 1
 
-    # Create sequences
     X_enc, X_dec, y = create_sequences(raw_data, macro_df, LOOKBACK, 1)
     dataset = TensorDataset(X_enc, X_dec, y)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -139,19 +131,16 @@ def main():
     model = InformerModel(INFORMER_CONFIG).to(device)
     train_model(model, loader, args.epochs, args.lr, device)
 
-    # Save model
     model_path = "informer_model.pth"
     torch.save(model.state_dict(), model_path)
     print("Model saved.")
 
-    # Upload to HF
     token = os.getenv("HF_TOKEN")
     if token:
         upload_file(path_or_fileobj=model_path, path_in_repo=model_path,
                     repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
         print("✅ Model uploaded")
 
-    # Generate and upload signals
     model.eval()
     signal_A = generate_signals('A', model, device, macro_df, LOOKBACK, 1)
     signal_B = generate_signals('B', model, device, macro_df, LOOKBACK, 1)
