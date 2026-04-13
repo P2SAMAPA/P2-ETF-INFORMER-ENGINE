@@ -24,64 +24,77 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_sequences(data_dict, macro_df, seq_len, pred_len, scaler=None):
+def gaussian_nll_loss(mu, log_sigma, target):
+    sigma = torch.exp(log_sigma) + 1e-6
+    loss = 0.5 * ((target - mu) / sigma).pow(2) + log_sigma
+    return loss.mean()
+
+def create_sequences(data_dict, macro_df, seq_len, pred_len, target_scaler=None, feature_scaler=None):
     X_enc_list, X_dec_list, y_list = [], [], []
-    # First collect all feature arrays, clean them
     all_features = []
+    all_targets = []
     for ticker, df in data_dict.items():
         feat = engineer_features(df, macro_df)
         values = feat.values
-        # Clean: replace inf, -inf, nan with 0
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         all_features.append(values)
+        targets = df['close'].pct_change().shift(-pred_len).values
+        targets = np.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+        all_targets.append(targets)
     all_features = np.vstack(all_features)
-    # Remove constant columns (std=0) to avoid scaler warning
+    all_targets = np.hstack(all_targets)
+
+    # Remove constant feature columns
     stds = all_features.std(axis=0)
     non_const = stds > 1e-8
     all_features = all_features[:, non_const]
-    if scaler is None:
-        scaler = StandardScaler()
-        scaler.fit(all_features)
-    # Now process each ticker with the same scaler, using only non-constant columns
+    if feature_scaler is None:
+        feature_scaler = StandardScaler()
+        feature_scaler.fit(all_features)
+    if target_scaler is None:
+        target_scaler = StandardScaler()
+        target_scaler.fit(all_targets.reshape(-1, 1))
+
     for ticker, df in data_dict.items():
         feat = engineer_features(df, macro_df)
         values = feat.values
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-        values = values[:, non_const]  # keep same columns as scaler
+        values = values[:, non_const]
+        values_scaled = feature_scaler.transform(values)
         targets = df['close'].pct_change().shift(-pred_len).values
-        for i in range(seq_len, len(values) - pred_len):
-            x_enc = values[i-seq_len:i]
+        targets = np.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+        targets_scaled = target_scaler.transform(targets.reshape(-1, 1)).ravel()
+        for i in range(seq_len, len(values_scaled) - pred_len):
+            x_enc = values_scaled[i-seq_len:i]
             x_dec = np.zeros((seq_len + pred_len, x_enc.shape[-1]))
             x_dec[:seq_len] = x_enc
-            y = targets[i+pred_len-1] if pred_len==1 else targets[i:i+pred_len]
+            y = targets_scaled[i+pred_len-1] if pred_len==1 else targets_scaled[i:i+pred_len].mean()
             X_enc_list.append(x_enc)
             X_dec_list.append(x_dec)
             y_list.append(y)
     X_enc = torch.tensor(np.array(X_enc_list), dtype=torch.float32)
     X_dec = torch.tensor(np.array(X_dec_list), dtype=torch.float32)
     y = torch.tensor(np.array(y_list), dtype=torch.float32).unsqueeze(1)
-    return X_enc, X_dec, y, scaler, non_const
+    return X_enc, X_dec, y, feature_scaler, target_scaler, non_const
 
 def train_model(model, loader, epochs, lr, device):
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
     for epoch in range(epochs):
         model.train()
         total_loss = 0
         for x_enc, x_dec, y in loader:
             x_enc, x_dec, y = x_enc.to(device), x_dec.to(device), y.to(device)
-            pred = model(x_enc, x_dec)
-            loss = criterion(pred, y)
+            mu, log_sigma = model(x_enc, x_dec)
+            loss = gaussian_nll_loss(mu, log_sigma, y.squeeze())
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
         if (epoch+1) % 10 == 0:
-            avg_loss = total_loss / len(loader)
-            print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.6f}")
+            print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(loader):.6f}")
 
-def generate_signals(option, model, device, macro_df, seq_len, pred_len, scaler, non_const):
+def generate_signals(option, model, device, macro_df, seq_len, pred_len, feature_scaler, target_scaler, non_const):
     if option == 'A':
         tickers = OPTION_A_ETFS
     else:
@@ -98,18 +111,18 @@ def generate_signals(option, model, device, macro_df, seq_len, pred_len, scaler,
         values = values[:, non_const]
         if len(values) < seq_len:
             continue
-        values_scaled = scaler.transform(values)
+        values_scaled = feature_scaler.transform(values)
         x_enc = torch.tensor(values_scaled, dtype=torch.float32).unsqueeze(0).to(device)
         x_dec = torch.zeros(1, seq_len+pred_len, values_scaled.shape[-1], device=device)
         x_dec[:, :seq_len] = x_enc
         with torch.no_grad():
-            pred = model(x_enc, x_dec)
-        mu = pred[0, -1].item()
-        if np.isnan(mu):
-            mu = 0.0
-        sigma = 0.01  # fixed uncertainty
+            mu_scaled, log_sigma_scaled = model(x_enc, x_dec)
+        mu = target_scaler.inverse_transform(mu_scaled.cpu().numpy())[0, -1]
+        sigma_scaled = torch.exp(log_sigma_scaled).cpu().numpy()[0, -1]
+        # Inverse transform sigma (approximate: scale by target_scaler.scale_)
+        sigma = sigma_scaled * target_scaler.scale_[0]
         confidence = 1 - 2 * sigma / (abs(mu) + sigma + 1e-8)
-        forecasts[ticker] = {'mu': mu, 'sigma': sigma, 'confidence': confidence}
+        forecasts[ticker] = {'mu': float(mu), 'sigma': float(sigma), 'confidence': float(confidence)}
     if forecasts:
         top_pick = max(forecasts, key=lambda x: forecasts[x]['mu'])
         top_mu = forecasts[top_pick]['mu']
@@ -126,9 +139,9 @@ def generate_signals(option, model, device, macro_df, seq_len, pred_len, scaler,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--option", default="both", choices=["a","b","both"])
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
-    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -141,10 +154,9 @@ def main():
         dummy_idx = next(iter(raw_data.values())).index
         macro_df = pd.DataFrame(index=dummy_idx, data={'dummy':0.0})
 
-    # Determine feature dimension after cleaning (non_const will be used)
-    X_enc, X_dec, y, scaler, non_const = create_sequences(raw_data, macro_df, LOOKBACK, 1)
+    X_enc, X_dec, y, feature_scaler, target_scaler, non_const = create_sequences(
+        raw_data, macro_df, LOOKBACK, 1)
     print(f"X_enc shape: {X_enc.shape}, X_dec shape: {X_dec.shape}, y shape: {y.shape}")
-    print(f"Feature dimension after cleaning: {X_enc.shape[-1]}")
 
     dataset = TensorDataset(X_enc, X_dec, y)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -158,27 +170,31 @@ def main():
     model = InformerModel(INFORMER_CONFIG).to(device)
     train_model(model, loader, args.epochs, args.lr, device)
 
-    # Save model, scaler, and non_const mask
     model_path = "informer_model.pth"
     torch.save(model.state_dict(), model_path)
     import joblib
-    joblib.dump(scaler, "scaler.pkl")
+    joblib.dump(feature_scaler, "feature_scaler.pkl")
+    joblib.dump(target_scaler, "target_scaler.pkl")
     joblib.dump(non_const, "non_const.pkl")
-    print("Model, scaler, and feature mask saved.")
+    print("Model and scalers saved.")
 
     token = os.getenv("HF_TOKEN")
     if token:
         upload_file(path_or_fileobj=model_path, path_in_repo=model_path,
                     repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
-        upload_file(path_or_fileobj="scaler.pkl", path_in_repo="scaler.pkl",
+        upload_file(path_or_fileobj="feature_scaler.pkl", path_in_repo="feature_scaler.pkl",
+                    repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
+        upload_file(path_or_fileobj="target_scaler.pkl", path_in_repo="target_scaler.pkl",
                     repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
         upload_file(path_or_fileobj="non_const.pkl", path_in_repo="non_const.pkl",
                     repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
         print("✅ Model and preprocessors uploaded")
 
     model.eval()
-    signal_A = generate_signals('A', model, device, macro_df, LOOKBACK, 1, scaler, non_const)
-    signal_B = generate_signals('B', model, device, macro_df, LOOKBACK, 1, scaler, non_const)
+    signal_A = generate_signals('A', model, device, macro_df, LOOKBACK, 1,
+                                feature_scaler, target_scaler, non_const)
+    signal_B = generate_signals('B', model, device, macro_df, LOOKBACK, 1,
+                                feature_scaler, target_scaler, non_const)
 
     os.makedirs("signals", exist_ok=True)
     with open("signals/signal_A.json", "w") as f:
