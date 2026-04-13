@@ -15,6 +15,7 @@ from features import engineer_features
 from model import InformerModel
 from huggingface_hub import upload_file
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import norm   # for confidence = P(return > 0)
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -116,12 +117,16 @@ def generate_signals(option, model, device, macro_df, seq_len, pred_len, feature
         x_dec[:, :seq_len] = x_enc
         with torch.no_grad():
             mu_scaled, log_sigma_scaled = model(x_enc, x_dec)
-        # mu_scaled shape: (1, pred_len) -> convert to numpy and reshape for inverse_transform
-        mu_scaled_np = mu_scaled.cpu().numpy().reshape(-1, 1)  # (pred_len, 1)
-        mu = target_scaler.inverse_transform(mu_scaled_np)[-1, 0]  # last prediction
+        # Convert to original return scale
+        mu_scaled_np = mu_scaled.cpu().numpy().reshape(-1, 1)
+        mu = target_scaler.inverse_transform(mu_scaled_np)[-1, 0]
         sigma_scaled = torch.exp(log_sigma_scaled).cpu().numpy().reshape(-1, 1)[-1, 0]
         sigma = sigma_scaled * target_scaler.scale_[0]
-        confidence = 1 - 2 * sigma / (abs(mu) + sigma + 1e-8)
+        # Probability of positive return (confidence)
+        if sigma > 0:
+            confidence = norm.cdf(mu / sigma)
+        else:
+            confidence = 0.5
         forecasts[ticker] = {'mu': float(mu), 'sigma': float(sigma), 'confidence': float(confidence)}
     if forecasts:
         top_pick = max(forecasts, key=lambda x: forecasts[x]['mu'])
