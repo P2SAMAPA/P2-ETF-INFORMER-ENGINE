@@ -13,9 +13,12 @@ def main():
                                  repo_type="dataset", token=os.getenv("HF_TOKEN"))
     scaler_path = hf_hub_download(repo_id=HF_DATASET_OUTPUT, filename="scaler.pkl",
                                   repo_type="dataset", token=os.getenv("HF_TOKEN"))
+    mask_path = hf_hub_download(repo_id=HF_DATASET_OUTPUT, filename="non_const.pkl",
+                                repo_type="dataset", token=os.getenv("HF_TOKEN"))
     scaler = joblib.load(scaler_path)
+    non_const = joblib.load(mask_path)
 
-    # Determine feature dimension
+    # Determine feature dimension (same as in training)
     sample_data = load_dataset("both", include_benchmarks=False)
     sample_ticker = next(iter(sample_data.keys()))
     macro_df = load_macro_data()
@@ -23,7 +26,8 @@ def main():
         dummy_idx = sample_data[sample_ticker].index
         macro_df = pd.DataFrame(index=dummy_idx, data={'dummy':0.0})
     sample_feat = engineer_features(sample_data[sample_ticker], macro_df)
-    feature_dim = sample_feat.shape[1]
+    sample_feat_clean = np.nan_to_num(sample_feat.values, nan=0.0, posinf=0.0, neginf=0.0)
+    feature_dim = sample_feat_clean[:, non_const].shape[1]
 
     INFORMER_CONFIG['enc_in'] = feature_dim
     INFORMER_CONFIG['dec_in'] = feature_dim
@@ -42,9 +46,12 @@ def main():
             if ticker not in data: continue
             df = data[ticker]
             feat = engineer_features(df, macro_df)
-            values = scaler.transform(feat.values[-LOOKBACK:].astype(np.float32))
+            values = feat.values[-LOOKBACK:].astype(np.float32)
+            values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+            values = values[:, non_const]
             if len(values) < LOOKBACK: continue
-            x_enc = torch.tensor(values, dtype=torch.float32).unsqueeze(0).to(device)
+            values_scaled = scaler.transform(values)
+            x_enc = torch.tensor(values_scaled, dtype=torch.float32).unsqueeze(0).to(device)
             x_dec = torch.zeros(1, LOOKBACK+1, feature_dim, device=device)
             x_dec[:, :LOOKBACK] = x_enc
             with torch.no_grad():
