@@ -21,11 +21,14 @@ class ProbSparseAttention(nn.Module):
         B, H, L, D = Q.shape
         _, _, S, _ = K.shape
         # Sample K
-        index_sample = torch.randint(0, S, (sample_k,))
+        sample_k = min(sample_k, S)
+        index_sample = torch.randint(0, S, (sample_k,), device=Q.device)
         K_sample = K[:, :, index_sample, :]
         # Compute M (sparsity)
         Q_K_sample = torch.matmul(Q, K_sample.transpose(-2, -1))
         M = Q_K_sample.max(dim=-1)[0] - Q_K_sample.mean(dim=-1)
+        # Clamp n_top to L
+        n_top = min(n_top, L)
         M_top = M.topk(n_top, dim=-1)[1]
         Q_reduce = Q.gather(-2, M_top.unsqueeze(-1).expand(-1, -1, -1, D))
         return Q_reduce, M_top
