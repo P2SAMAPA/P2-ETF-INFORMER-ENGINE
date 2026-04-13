@@ -1,0 +1,22 @@
+name: Informer Daily Train & Signal Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 0 * * *'
+
+jobs:
+  train_and_signal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements_train.txt
+      - run: python validate_dataset.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - run: python train.py --option both
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
