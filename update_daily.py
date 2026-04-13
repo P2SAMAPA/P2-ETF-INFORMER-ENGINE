@@ -6,6 +6,7 @@ from loader import load_dataset, load_macro_data
 from features import engineer_features
 from model import InformerModel
 import joblib
+from scipy.stats import norm
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,10 +56,11 @@ def main():
             x_dec[:, :LOOKBACK] = x_enc
             with torch.no_grad():
                 mu_scaled, log_sigma_scaled = model(x_enc, x_dec)
-            mu = target_scaler.inverse_transform(mu_scaled.cpu().numpy())[0, -1]
-            sigma_scaled = torch.exp(log_sigma_scaled).cpu().numpy()[0, -1]
+            mu_scaled_np = mu_scaled.cpu().numpy().reshape(-1, 1)
+            mu = target_scaler.inverse_transform(mu_scaled_np)[-1, 0]
+            sigma_scaled = torch.exp(log_sigma_scaled).cpu().numpy().reshape(-1, 1)[-1, 0]
             sigma = sigma_scaled * target_scaler.scale_[0]
-            confidence = 1 - 2*sigma/(abs(mu)+sigma+1e-8)
+            confidence = norm.cdf(mu / sigma) if sigma > 0 else 0.5
             forecasts[ticker] = {'mu': float(mu), 'sigma': float(sigma), 'confidence': float(confidence)}
         top_pick = max(forecasts, key=lambda x: forecasts[x]['mu']) if forecasts else None
         return {"generated_at": datetime.utcnow().isoformat(), "forecasts": forecasts,
