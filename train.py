@@ -14,6 +14,7 @@ from loader import load_dataset, load_macro_data
 from features import engineer_features
 from model import InformerModel
 from huggingface_hub import upload_file
+from sklearn.preprocessing import StandardScaler
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -23,14 +24,24 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_sequences(data_dict, macro_df, seq_len, pred_len):
+def create_sequences(data_dict, macro_df, seq_len, pred_len, scaler=None):
     X_enc_list, X_dec_list, y_list = [], [], []
+    # First collect all feature arrays
+    all_features = []
     for ticker, df in data_dict.items():
         feat = engineer_features(df, macro_df)
-        values = feat.values.astype(np.float32)
+        all_features.append(feat.values)
+    all_features = np.vstack(all_features)
+    if scaler is None:
+        scaler = StandardScaler()
+        scaler.fit(all_features)
+    # Now scale each ticker's features
+    for ticker, df in data_dict.items():
+        feat = engineer_features(df, macro_df)
+        values = scaler.transform(feat.values.astype(np.float32))
         targets = df['close'].pct_change().shift(-pred_len).values
         for i in range(seq_len, len(values) - pred_len):
-            x_enc = values[i-seq_len:i]                 # (seq_len, feat_dim)
+            x_enc = values[i-seq_len:i]
             x_dec = np.zeros((seq_len + pred_len, x_enc.shape[-1]))
             x_dec[:seq_len] = x_enc
             y = targets[i+pred_len-1] if pred_len==1 else targets[i:i+pred_len]
@@ -40,7 +51,7 @@ def create_sequences(data_dict, macro_df, seq_len, pred_len):
     X_enc = torch.tensor(np.array(X_enc_list), dtype=torch.float32)
     X_dec = torch.tensor(np.array(X_dec_list), dtype=torch.float32)
     y = torch.tensor(np.array(y_list), dtype=torch.float32).unsqueeze(1)
-    return X_enc, X_dec, y
+    return X_enc, X_dec, y, scaler
 
 def train_model(model, loader, epochs, lr, device):
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -54,12 +65,14 @@ def train_model(model, loader, epochs, lr, device):
             loss = criterion(pred, y)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
         if (epoch+1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(loader):.6f}")
+            avg_loss = total_loss / len(loader)
+            print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.6f}")
 
-def generate_signals(option, model, device, macro_df, seq_len, pred_len):
+def generate_signals(option, model, device, macro_df, seq_len, pred_len, scaler):
     if option == 'A':
         tickers = OPTION_A_ETFS
     else:
@@ -71,16 +84,18 @@ def generate_signals(option, model, device, macro_df, seq_len, pred_len):
             continue
         df = raw_data[ticker]
         feat = engineer_features(df, macro_df)
-        values = feat.values[-seq_len:].astype(np.float32)
+        values = scaler.transform(feat.values[-seq_len:].astype(np.float32))
         if len(values) < seq_len:
             continue
         x_enc = torch.tensor(values, dtype=torch.float32).unsqueeze(0).to(device)
-        x_dec = torch.zeros(1, seq_len+pred_len, feat.shape[-1], device=device)
+        x_dec = torch.zeros(1, seq_len+pred_len, values.shape[-1], device=device)
         x_dec[:, :seq_len] = x_enc
         with torch.no_grad():
             pred = model(x_enc, x_dec)
         mu = pred[0, -1].item()
-        sigma = 0.015  # placeholder
+        if np.isnan(mu):
+            mu = 0.0
+        sigma = 0.01  # fixed uncertainty (can be calibrated)
         confidence = 1 - 2 * sigma / (abs(mu) + sigma + 1e-8)
         forecasts[ticker] = {'mu': mu, 'sigma': sigma, 'confidence': confidence}
     if forecasts:
@@ -114,9 +129,17 @@ def main():
         dummy_idx = next(iter(raw_data.values())).index
         macro_df = pd.DataFrame(index=dummy_idx, data={'dummy':0.0})
 
+    # Determine feature dimension
     sample_ticker = next(iter(raw_data.keys()))
     sample_feat = engineer_features(raw_data[sample_ticker], macro_df)
     feature_dim = sample_feat.shape[1]
+
+    # Prepare sequences with scaling
+    X_enc, X_dec, y, scaler = create_sequences(raw_data, macro_df, LOOKBACK, 1)
+    print(f"X_enc shape: {X_enc.shape}, X_dec shape: {X_dec.shape}, y shape: {y.shape}")
+
+    dataset = TensorDataset(X_enc, X_dec, y)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
     INFORMER_CONFIG['enc_in'] = feature_dim
     INFORMER_CONFIG['dec_in'] = feature_dim
@@ -124,26 +147,28 @@ def main():
     INFORMER_CONFIG['label_len'] = LOOKBACK // 2
     INFORMER_CONFIG['pred_len'] = 1
 
-    X_enc, X_dec, y = create_sequences(raw_data, macro_df, LOOKBACK, 1)
-    dataset = TensorDataset(X_enc, X_dec, y)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-
     model = InformerModel(INFORMER_CONFIG).to(device)
     train_model(model, loader, args.epochs, args.lr, device)
 
+    # Save model and scaler
     model_path = "informer_model.pth"
     torch.save(model.state_dict(), model_path)
-    print("Model saved.")
+    import joblib
+    joblib.dump(scaler, "scaler.pkl")
+    print("Model and scaler saved.")
 
     token = os.getenv("HF_TOKEN")
     if token:
+        from huggingface_hub import upload_file
         upload_file(path_or_fileobj=model_path, path_in_repo=model_path,
                     repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
-        print("✅ Model uploaded")
+        upload_file(path_or_fileobj="scaler.pkl", path_in_repo="scaler.pkl",
+                    repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
+        print("✅ Model and scaler uploaded")
 
     model.eval()
-    signal_A = generate_signals('A', model, device, macro_df, LOOKBACK, 1)
-    signal_B = generate_signals('B', model, device, macro_df, LOOKBACK, 1)
+    signal_A = generate_signals('A', model, device, macro_df, LOOKBACK, 1, scaler)
+    signal_B = generate_signals('B', model, device, macro_df, LOOKBACK, 1, scaler)
 
     os.makedirs("signals", exist_ok=True)
     with open("signals/signal_A.json", "w") as f:
