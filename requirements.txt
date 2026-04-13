@@ -1,0 +1,8 @@
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.17.0
+huggingface_hub>=0.20.0
+torch>=2.0.0
+holidays>=0.25
+pyarrow>=14.0.0
