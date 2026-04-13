@@ -7,3 +7,5 @@ torch>=2.0.0
 holidays>=0.25
 pyarrow>=14.0.0
 matplotlib>=3.5.0
+scikit-learn>=1.2.0
+joblib>=1.2.0
