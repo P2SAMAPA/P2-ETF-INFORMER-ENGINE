@@ -6,3 +6,4 @@ huggingface_hub>=0.20.0
 torch>=2.0.0
 holidays>=0.25
 pyarrow>=14.0.0
+matplotlib>=3.5.0
