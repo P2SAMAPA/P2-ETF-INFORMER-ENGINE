@@ -20,15 +20,14 @@ class ProbSparseAttention(nn.Module):
     def _prob_qk(self, Q, K, sample_k, n_top):
         B, H, L, D = Q.shape
         _, _, S, _ = K.shape
-        # Sample K
         sample_k = min(sample_k, S)
+        n_top = min(n_top, L)
+        if sample_k <= 0 or n_top <= 0:
+            return Q, torch.arange(L, device=Q.device).unsqueeze(0).unsqueeze(0).expand(B, H, -1)
         index_sample = torch.randint(0, S, (sample_k,), device=Q.device)
         K_sample = K[:, :, index_sample, :]
-        # Compute M (sparsity)
         Q_K_sample = torch.matmul(Q, K_sample.transpose(-2, -1))
         M = Q_K_sample.max(dim=-1)[0] - Q_K_sample.mean(dim=-1)
-        # Clamp n_top to L
-        n_top = min(n_top, L)
         M_top = M.topk(n_top, dim=-1)[1]
         Q_reduce = Q.gather(-2, M_top.unsqueeze(-1).expand(-1, -1, -1, D))
         return Q_reduce, M_top
@@ -42,14 +41,14 @@ class ProbSparseAttention(nn.Module):
         V = self.v_linear(values).view(B, S, self.n_heads, self.d_k).transpose(1,2)
 
         sample_k = min(self.factor * int(math.log(L)), S)
-        n_top = int(self.factor * math.log(L))
+        n_top = min(self.factor * int(math.log(L)), L)
+        if n_top < 1:
+            n_top = 1
         Q_reduce, M_top = self._prob_qk(Q, K, sample_k, n_top)
 
-        # Attention on reduced Q
         attn = torch.matmul(Q_reduce, K.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
         context = torch.matmul(attn, V)
-        # Expand back
         zeros = torch.zeros(B, self.n_heads, L, self.d_k, device=queries.device)
         zeros.scatter_(-2, M_top.unsqueeze(-1).expand(-1, -1, -1, self.d_k), context)
         out = zeros.transpose(1,2).contiguous().view(B, L, -1)
@@ -84,10 +83,8 @@ class EncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # ProbSparse self-attention
         attn = self.attention(x, x, x)
         x = self.norm1(x + self.dropout(attn))
-        # FFN
         ff = self.ff(x)
         x = self.norm2(x + self.dropout(ff))
         return x
@@ -121,13 +118,10 @@ class DecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, enc_out):
-        # Self-attention
         attn = self.self_attn(x, x, x)
         x = self.norm1(x + self.dropout(attn))
-        # Cross-attention
         attn2, _ = self.cross_attn(x, enc_out, enc_out)
         x = self.norm2(x + self.dropout(attn2))
-        # FFN
         ff = self.ff(x)
         x = self.norm3(x + self.dropout(ff))
         return x
@@ -150,37 +144,32 @@ class InformerModel(nn.Module):
         self.pred_len = config['pred_len']
         self.enc_in = config['enc_in']
         self.dec_in = config['dec_in']
-        self.c_out = config['c_out']
         self.d_model = config['d_model']
         self.dropout = config['dropout']
 
-        # Embeddings
         self.enc_embed = nn.Linear(self.enc_in, self.d_model)
         self.dec_embed = nn.Linear(self.dec_in, self.d_model)
         self.pos_enc = nn.Parameter(torch.zeros(1, self.seq_len + self.label_len + self.pred_len, self.d_model))
 
-        # Encoder
         encoder_layers = [EncoderLayer(self.d_model, config['n_heads'], config['d_ff'], self.dropout, config['factor']) for _ in range(config['e_layers'])]
         conv_layers = [ConvLayer(self.d_model) for _ in range(config['e_layers']-1)] if config['distil'] else None
         self.encoder = Encoder(encoder_layers, conv_layers)
 
-        # Decoder
         decoder_layers = [DecoderLayer(self.d_model, config['n_heads'], config['d_ff'], self.dropout, config['factor']) for _ in range(config['d_layers'])]
         self.decoder = Decoder(decoder_layers)
 
-        self.projection = nn.Linear(self.d_model, self.c_out)
+        # Output: mu and log_sigma
+        self.projection = nn.Linear(self.d_model, 2)
 
     def forward(self, x_enc, x_dec):
-        # x_enc: (B, seq_len, enc_in)
-        # x_dec: (B, label_len + pred_len, dec_in)
         B = x_enc.shape[0]
-
-        # Embed + pos encoding
         enc_out = self.enc_embed(x_enc) + self.pos_enc[:, :self.seq_len, :]
         enc_out = self.encoder(enc_out)
 
         dec_out = self.dec_embed(x_dec) + self.pos_enc[:, :x_dec.shape[1], :]
         dec_out = self.decoder(dec_out, enc_out)
 
-        output = self.projection(dec_out)[:, -self.pred_len:, :]  # (B, pred_len, 1)
-        return output.squeeze(-1)  # (B, pred_len)
+        out = self.projection(dec_out)[:, -self.pred_len:, :]  # (B, pred_len, 2)
+        mu = out[:, :, 0].squeeze(-1)
+        log_sigma = out[:, :, 1].squeeze(-1)
+        return mu, log_sigma
