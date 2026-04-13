@@ -26,19 +26,28 @@ def set_seed(seed=42):
 
 def create_sequences(data_dict, macro_df, seq_len, pred_len, scaler=None):
     X_enc_list, X_dec_list, y_list = [], [], []
-    # First collect all feature arrays
+    # First collect all feature arrays, clean them
     all_features = []
     for ticker, df in data_dict.items():
         feat = engineer_features(df, macro_df)
-        all_features.append(feat.values)
+        values = feat.values
+        # Clean: replace inf, -inf, nan with 0
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        all_features.append(values)
     all_features = np.vstack(all_features)
+    # Remove constant columns (std=0) to avoid scaler warning
+    stds = all_features.std(axis=0)
+    non_const = stds > 1e-8
+    all_features = all_features[:, non_const]
     if scaler is None:
         scaler = StandardScaler()
         scaler.fit(all_features)
-    # Now scale each ticker's features
+    # Now process each ticker with the same scaler, using only non-constant columns
     for ticker, df in data_dict.items():
         feat = engineer_features(df, macro_df)
-        values = scaler.transform(feat.values.astype(np.float32))
+        values = feat.values
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        values = values[:, non_const]  # keep same columns as scaler
         targets = df['close'].pct_change().shift(-pred_len).values
         for i in range(seq_len, len(values) - pred_len):
             x_enc = values[i-seq_len:i]
@@ -51,7 +60,7 @@ def create_sequences(data_dict, macro_df, seq_len, pred_len, scaler=None):
     X_enc = torch.tensor(np.array(X_enc_list), dtype=torch.float32)
     X_dec = torch.tensor(np.array(X_dec_list), dtype=torch.float32)
     y = torch.tensor(np.array(y_list), dtype=torch.float32).unsqueeze(1)
-    return X_enc, X_dec, y, scaler
+    return X_enc, X_dec, y, scaler, non_const
 
 def train_model(model, loader, epochs, lr, device):
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -72,7 +81,7 @@ def train_model(model, loader, epochs, lr, device):
             avg_loss = total_loss / len(loader)
             print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.6f}")
 
-def generate_signals(option, model, device, macro_df, seq_len, pred_len, scaler):
+def generate_signals(option, model, device, macro_df, seq_len, pred_len, scaler, non_const):
     if option == 'A':
         tickers = OPTION_A_ETFS
     else:
@@ -84,18 +93,21 @@ def generate_signals(option, model, device, macro_df, seq_len, pred_len, scaler)
             continue
         df = raw_data[ticker]
         feat = engineer_features(df, macro_df)
-        values = scaler.transform(feat.values[-seq_len:].astype(np.float32))
+        values = feat.values[-seq_len:].astype(np.float32)
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        values = values[:, non_const]
         if len(values) < seq_len:
             continue
-        x_enc = torch.tensor(values, dtype=torch.float32).unsqueeze(0).to(device)
-        x_dec = torch.zeros(1, seq_len+pred_len, values.shape[-1], device=device)
+        values_scaled = scaler.transform(values)
+        x_enc = torch.tensor(values_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+        x_dec = torch.zeros(1, seq_len+pred_len, values_scaled.shape[-1], device=device)
         x_dec[:, :seq_len] = x_enc
         with torch.no_grad():
             pred = model(x_enc, x_dec)
         mu = pred[0, -1].item()
         if np.isnan(mu):
             mu = 0.0
-        sigma = 0.01  # fixed uncertainty (can be calibrated)
+        sigma = 0.01  # fixed uncertainty
         confidence = 1 - 2 * sigma / (abs(mu) + sigma + 1e-8)
         forecasts[ticker] = {'mu': mu, 'sigma': sigma, 'confidence': confidence}
     if forecasts:
@@ -129,20 +141,16 @@ def main():
         dummy_idx = next(iter(raw_data.values())).index
         macro_df = pd.DataFrame(index=dummy_idx, data={'dummy':0.0})
 
-    # Determine feature dimension
-    sample_ticker = next(iter(raw_data.keys()))
-    sample_feat = engineer_features(raw_data[sample_ticker], macro_df)
-    feature_dim = sample_feat.shape[1]
-
-    # Prepare sequences with scaling
-    X_enc, X_dec, y, scaler = create_sequences(raw_data, macro_df, LOOKBACK, 1)
+    # Determine feature dimension after cleaning (non_const will be used)
+    X_enc, X_dec, y, scaler, non_const = create_sequences(raw_data, macro_df, LOOKBACK, 1)
     print(f"X_enc shape: {X_enc.shape}, X_dec shape: {X_dec.shape}, y shape: {y.shape}")
+    print(f"Feature dimension after cleaning: {X_enc.shape[-1]}")
 
     dataset = TensorDataset(X_enc, X_dec, y)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    INFORMER_CONFIG['enc_in'] = feature_dim
-    INFORMER_CONFIG['dec_in'] = feature_dim
+    INFORMER_CONFIG['enc_in'] = X_enc.shape[-1]
+    INFORMER_CONFIG['dec_in'] = X_enc.shape[-1]
     INFORMER_CONFIG['seq_len'] = LOOKBACK
     INFORMER_CONFIG['label_len'] = LOOKBACK // 2
     INFORMER_CONFIG['pred_len'] = 1
@@ -150,25 +158,27 @@ def main():
     model = InformerModel(INFORMER_CONFIG).to(device)
     train_model(model, loader, args.epochs, args.lr, device)
 
-    # Save model and scaler
+    # Save model, scaler, and non_const mask
     model_path = "informer_model.pth"
     torch.save(model.state_dict(), model_path)
     import joblib
     joblib.dump(scaler, "scaler.pkl")
-    print("Model and scaler saved.")
+    joblib.dump(non_const, "non_const.pkl")
+    print("Model, scaler, and feature mask saved.")
 
     token = os.getenv("HF_TOKEN")
     if token:
-        from huggingface_hub import upload_file
         upload_file(path_or_fileobj=model_path, path_in_repo=model_path,
                     repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
         upload_file(path_or_fileobj="scaler.pkl", path_in_repo="scaler.pkl",
                     repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
-        print("✅ Model and scaler uploaded")
+        upload_file(path_or_fileobj="non_const.pkl", path_in_repo="non_const.pkl",
+                    repo_id=HF_DATASET_OUTPUT, repo_type="dataset", token=token)
+        print("✅ Model and preprocessors uploaded")
 
     model.eval()
-    signal_A = generate_signals('A', model, device, macro_df, LOOKBACK, 1, scaler)
-    signal_B = generate_signals('B', model, device, macro_df, LOOKBACK, 1, scaler)
+    signal_A = generate_signals('A', model, device, macro_df, LOOKBACK, 1, scaler, non_const)
+    signal_B = generate_signals('B', model, device, macro_df, LOOKBACK, 1, scaler, non_const)
 
     os.makedirs("signals", exist_ok=True)
     with open("signals/signal_A.json", "w") as f:
