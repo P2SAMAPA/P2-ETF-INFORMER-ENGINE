@@ -44,7 +44,6 @@ def create_sequences(data_dict, macro_df, seq_len, pred_len, target_scaler=None,
     all_features = np.vstack(all_features)
     all_targets = np.hstack(all_targets)
 
-    # Remove constant feature columns
     stds = all_features.std(axis=0)
     non_const = stds > 1e-8
     all_features = all_features[:, non_const]
@@ -117,9 +116,10 @@ def generate_signals(option, model, device, macro_df, seq_len, pred_len, feature
         x_dec[:, :seq_len] = x_enc
         with torch.no_grad():
             mu_scaled, log_sigma_scaled = model(x_enc, x_dec)
-        mu = target_scaler.inverse_transform(mu_scaled.cpu().numpy())[0, -1]
-        sigma_scaled = torch.exp(log_sigma_scaled).cpu().numpy()[0, -1]
-        # Inverse transform sigma (approximate: scale by target_scaler.scale_)
+        # mu_scaled shape: (1, pred_len) -> convert to numpy and reshape for inverse_transform
+        mu_scaled_np = mu_scaled.cpu().numpy().reshape(-1, 1)  # (pred_len, 1)
+        mu = target_scaler.inverse_transform(mu_scaled_np)[-1, 0]  # last prediction
+        sigma_scaled = torch.exp(log_sigma_scaled).cpu().numpy().reshape(-1, 1)[-1, 0]
         sigma = sigma_scaled * target_scaler.scale_[0]
         confidence = 1 - 2 * sigma / (abs(mu) + sigma + 1e-8)
         forecasts[ticker] = {'mu': float(mu), 'sigma': float(sigma), 'confidence': float(confidence)}
