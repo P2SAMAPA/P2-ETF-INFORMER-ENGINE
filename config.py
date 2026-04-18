@@ -6,7 +6,7 @@ HF_DATASET_OUTPUT = "P2SAMAPA/p2-etf-informer-results"   # new output dataset
 OPTION_A_ETFS = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV", "PFF", "MBB"]
 
 # Option B – Equity Sectors (tradable, no SPY)
-OPTION_B_ETFS = ["QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "GDX", "XME"]
+OPTION_B_ETFS = ["QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "IWM", "IWF", "XSD", "XBI", "GDX", "XME"]
 
 # Informer hyperparameters
 INFORMER_CONFIG = {
